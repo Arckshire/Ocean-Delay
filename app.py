@@ -3,21 +3,21 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 
-st.set_page_config(page_title="Ocean Delay Analyzer (VAD vs VAD_PLANNED)", layout="wide")
+st.set_page_config(page_title="Ocean Delay Analyzer (VAD/VAD_P44 vs VAD_PLANNED)", layout="wide")
 
-st.title("Ocean Delay Analyzer — VAD (Actual) vs VAD_PLANNED (Planned)")
+st.title("Ocean Delay Analyzer — Delay vs Plan (VAD / VAD_P44 vs VAD_PLANNED)")
 st.write(
-    "Upload the raw extract (CSV) from `OCEAN_DATA_QUALITY` and download an Excel report with:\n"
+    "Upload the raw extract (CSV) and download an Excel report with:\n"
     "- Raw Data\n"
     "- Carrier Performance\n"
-    "- Lane Performance\n\n"
+    "- Lane Performance\n"
+    "- Early Containers (container-level subset)\n"
+    "- Delayed Containers (container-level subset)\n\n"
     "Definitions:\n"
     "- Shipment unit = MASTER_SHIPMENT_ID (fallback to SHIPMENT_ID)\n"
     "- Lane = ORIGIN_CITY → DESTINATION_CITY (fallback to POL → POD if missing)\n"
-    "- Delay uses **Actual Arrival** as:\n"
-    "  1) `VAD` if present\n"
-    "  2) else `VAD_P44` if `VAD` missing\n"
-    "  Delay = Actual Arrival - `VAD_PLANNED` (in hours/days)\n"
+    "- Actual Arrival Used = VAD if present else VAD_P44\n"
+    "- Signed Delay = (Actual Arrival Used - VAD_PLANNED) in hours/days\n"
 )
 
 # ----------------------------
@@ -71,6 +71,7 @@ def make_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
         if pd.api.types.is_datetime64tz_dtype(out[col]):
             out[col] = out[col].dt.tz_convert(None)
 
+    # Handle object columns that might contain tz-aware pd.Timestamp values
     for col in out.columns:
         if out[col].dtype == "object":
             sample = out[col].dropna().head(50)
@@ -82,34 +83,39 @@ def make_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def to_excel_bytes(raw_df: pd.DataFrame, carrier_df: pd.DataFrame, lane_df: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-
-    raw_df = make_excel_safe(raw_df)
-    carrier_df = make_excel_safe(carrier_df)
-    lane_df = make_excel_safe(lane_df)
-
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        raw_df.to_excel(writer, index=False, sheet_name="Raw_Data")
-        carrier_df.to_excel(writer, index=False, sheet_name="Carrier_Performance")
-        lane_df.to_excel(writer, index=False, sheet_name="Lane_Performance")
-
-    return output.getvalue()
-
-
-def compute_delay_hours(planned: pd.Series, actual: pd.Series) -> pd.Series:
-    # planned and actual are datetime series
+def compute_hours(planned: pd.Series, actual: pd.Series) -> pd.Series:
     delta = actual - planned
     return delta.dt.total_seconds() / 3600.0
 
 
 def pick_actual_arrival(vad: pd.Series, vad_p44: pd.Series) -> pd.Series:
-    """
-    Actual arrival selection rule:
-    - Use VAD if present
-    - Else use VAD_P44
-    """
+    # prefer VAD, fallback to VAD_P44
     return vad.combine_first(vad_p44)
+
+
+def to_excel_bytes(
+    raw_df: pd.DataFrame,
+    carrier_df: pd.DataFrame,
+    lane_df: pd.DataFrame,
+    early_containers_df: pd.DataFrame,
+    delayed_containers_df: pd.DataFrame
+) -> bytes:
+    output = io.BytesIO()
+
+    raw_df = make_excel_safe(raw_df)
+    carrier_df = make_excel_safe(carrier_df)
+    lane_df = make_excel_safe(lane_df)
+    early_containers_df = make_excel_safe(early_containers_df)
+    delayed_containers_df = make_excel_safe(delayed_containers_df)
+
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        raw_df.to_excel(writer, index=False, sheet_name="Raw_Data")
+        carrier_df.to_excel(writer, index=False, sheet_name="Carrier_Performance")
+        lane_df.to_excel(writer, index=False, sheet_name="Lane_Performance")
+        early_containers_df.to_excel(writer, index=False, sheet_name="Early_Containers")
+        delayed_containers_df.to_excel(writer, index=False, sheet_name="Delayed_Containers")
+
+    return output.getvalue()
 
 
 # ----------------------------
@@ -119,7 +125,7 @@ uploaded = st.file_uploader("Upload raw extract CSV", type=["csv"])
 
 with st.expander("Settings", expanded=True):
     clamp_negative = st.checkbox(
-        "Treat early arrivals as 0 delay (recommended for 'delay' reporting)",
+        "Treat early arrivals as 0 delay in the delay metrics (recommended)",
         value=True
     )
     tie_breaker = st.selectbox(
@@ -131,8 +137,8 @@ with st.expander("Settings", expanded=True):
         index=0
     )
     st.info(
-        "Lane count (in Carrier Performance) = number of unique lanes a carrier operated on "
-        "(based on lane definition ORIGIN→DESTINATION fallback POL→POD)."
+        "Lane count (Carrier Performance) = number of unique lanes a carrier operated on "
+        "(based on ORIGIN→DESTINATION fallback POL→POD)."
     )
 
 if not uploaded:
@@ -177,6 +183,7 @@ for c in required_cols:
 df_raw["SHIPMENT_CREATED_DATE"] = to_dt(df_raw["SHIPMENT_CREATED_DATE"])
 df_raw["SHIPMENT_MODIFIED_DATE"] = to_dt(df_raw["SHIPMENT_MODIFIED_DATE"])
 df_raw["SUBSCRIPTION_CREATED_DT"] = to_dt(df_raw["SUBSCRIPTION_CREATED_DT"])
+
 df_raw["VAD_PLANNED"] = to_dt(df_raw["VAD_PLANNED"])
 df_raw["VAD"] = to_dt(df_raw["VAD"])
 df_raw["VAD_P44"] = to_dt(df_raw["VAD_P44"])
@@ -187,12 +194,18 @@ df_raw["LANE"] = build_lane(df_raw)
 df_raw["SHIPMENT_KEY"] = df_raw["MASTER_SHIPMENT_ID"].map(clean_str)
 df_raw.loc[df_raw["SHIPMENT_KEY"].isna(), "SHIPMENT_KEY"] = df_raw["SHIPMENT_ID"].map(clean_str)
 
-# Select actual arrival per-row and compute raw delay
+# Row-level "actual used" + signed delay
 df_raw["VAD_ACTUAL_USED"] = pick_actual_arrival(df_raw["VAD"], df_raw["VAD_P44"])
-df_raw["ACTUAL_SOURCE_USED"] = np.where(df_raw["VAD"].notna(), "VAD", np.where(df_raw["VAD_P44"].notna(), "VAD_P44", ""))
+df_raw["ACTUAL_SOURCE_USED"] = np.where(
+    df_raw["VAD"].notna(), "VAD",
+    np.where(df_raw["VAD_P44"].notna(), "VAD_P44", "")
+)
 
-df_raw["DELAY_HOURS_RAW"] = compute_delay_hours(df_raw["VAD_PLANNED"], df_raw["VAD_ACTUAL_USED"])
-df_raw["DELAY_HOURS"] = df_raw["DELAY_HOURS_RAW"].clip(lower=0) if clamp_negative else df_raw["DELAY_HOURS_RAW"]
+df_raw["SIGNED_DELAY_HOURS"] = compute_hours(df_raw["VAD_PLANNED"], df_raw["VAD_ACTUAL_USED"])
+df_raw["SIGNED_DELAY_DAYS"] = df_raw["SIGNED_DELAY_HOURS"] / 24.0
+
+# Delay metrics used for performance (optionally clamp early to 0)
+df_raw["DELAY_HOURS"] = df_raw["SIGNED_DELAY_HOURS"].clip(lower=0) if clamp_negative else df_raw["SIGNED_DELAY_HOURS"]
 df_raw["DELAY_DAYS"] = df_raw["DELAY_HOURS"] / 24.0
 
 # ----------------------------
@@ -214,6 +227,12 @@ shipment_level = (
         "LANE": first_non_null,
         "POL": first_non_null,
         "POD": first_non_null,
+        "POL_LOCODE": first_non_null,
+        "POD_LOCODE": first_non_null,
+        "ORIGIN_CITY": first_non_null,
+        "DESTINATION_CITY": first_non_null,
+        "ORIGIN_COUNTRY": first_non_null,
+        "DESTINATION_COUNTRY": first_non_null,
 
         "VAD_PLANNED": "max",
         "VAD": "max",
@@ -221,25 +240,30 @@ shipment_level = (
 
         "SHIPMENT_CREATED_DATE": "min",
         "SHIPMENT_MODIFIED_DATE": "max",
+        "SUBSCRIPTION_CREATED_DT": "min",
     })
     .reset_index()
 )
 
-# Pick actual arrival at shipment level (prefer VAD over VAD_P44)
 shipment_level["VAD_ACTUAL_USED"] = pick_actual_arrival(shipment_level["VAD"], shipment_level["VAD_P44"])
 shipment_level["ACTUAL_SOURCE_USED"] = np.where(
     shipment_level["VAD"].notna(), "VAD",
     np.where(shipment_level["VAD_P44"].notna(), "VAD_P44", "")
 )
 
-shipment_level["DELAY_HOURS_RAW"] = compute_delay_hours(shipment_level["VAD_PLANNED"], shipment_level["VAD_ACTUAL_USED"])
-shipment_level["DELAY_HOURS"] = shipment_level["DELAY_HOURS_RAW"].clip(lower=0) if clamp_negative else shipment_level["DELAY_HOURS_RAW"]
+shipment_level["SIGNED_DELAY_HOURS"] = compute_hours(shipment_level["VAD_PLANNED"], shipment_level["VAD_ACTUAL_USED"])
+shipment_level["SIGNED_DELAY_DAYS"] = shipment_level["SIGNED_DELAY_HOURS"] / 24.0
+
+shipment_level["DELAY_HOURS"] = shipment_level["SIGNED_DELAY_HOURS"].clip(lower=0) if clamp_negative else shipment_level["SIGNED_DELAY_HOURS"]
 shipment_level["DELAY_DAYS"] = shipment_level["DELAY_HOURS"] / 24.0
 
-# Shipments usable for delay calculations:
-# - Must have planned VAD
-# - Must have either VAD or VAD_P44 (via VAD_ACTUAL_USED)
+# Usable for delay: need planned + actual (VAD or VAD_P44)
 shipment_level_valid = shipment_level.dropna(subset=["VAD_PLANNED", "VAD_ACTUAL_USED"])
+
+# Classify shipments (based on SIGNED delay)
+shipment_level_valid["IS_EARLY"] = shipment_level_valid["SIGNED_DELAY_HOURS"] < 0
+shipment_level_valid["IS_DELAYED"] = shipment_level_valid["SIGNED_DELAY_HOURS"] > 0
+shipment_level_valid["IS_ONTIME"] = shipment_level_valid["SIGNED_DELAY_HOURS"] == 0
 
 # ----------------------------
 # Diagnostics: which carriers are excluded and why
@@ -291,9 +315,9 @@ carrier_diag = (
     .sort_values(["SHIPMENTS_USABLE_FOR_DELAY", "SHIPMENT_VOLUME"], ascending=[True, True])
 )
 
-st.subheader("Why you may see fewer carriers in Carrier_Performance")
+st.subheader("Diagnostics (why carriers may be missing from performance)")
 st.write(
-    "A carrier is excluded from **Carrier_Performance** if it has **zero shipments** where:\n"
+    "A carrier is excluded if it has **zero shipments** where:\n"
     "- `VAD_PLANNED` exists, and\n"
     "- at least one of `VAD` or `VAD_P44` exists (we prefer `VAD` when both exist)."
 )
@@ -310,25 +334,44 @@ st.dataframe(carrier_diag, use_container_width=True)
 # ----------------------------
 # Carrier performance
 # ----------------------------
+def sum_bool(s: pd.Series) -> int:
+    return int(s.sum())
+
 carrier_perf = (
     shipment_level_valid
     .groupby(["TENANT_NAME", "CARRIER_NAME", "CARRIER_SCAC"], dropna=False)
     .agg(
         SHIPMENT_VOLUME=("SHIPMENT_KEY", "nunique"),
+        DELAYED_SHIPMENTS=("IS_DELAYED", sum_bool),
+        EARLY_SHIPMENTS=("IS_EARLY", sum_bool),
         LANES=("LANE", "nunique"),
 
         TOTAL_DELAY_HOURS=("DELAY_HOURS", "sum"),
-        AVG_DELAY_HOURS=("DELAY_HOURS", "mean"),
-        MEDIAN_DELAY_HOURS=("DELAY_HOURS", "median"),
-        MAX_DELAY_HOURS=("DELAY_HOURS", "max"),
-
         TOTAL_DELAY_DAYS=("DELAY_DAYS", "sum"),
+
+        AVG_DELAY_HOURS=("DELAY_HOURS", "mean"),
         AVG_DELAY_DAYS=("DELAY_DAYS", "mean"),
+
+        MEDIAN_DELAY_HOURS=("DELAY_HOURS", "median"),
         MEDIAN_DELAY_DAYS=("DELAY_DAYS", "median"),
+
+        MAX_DELAY_HOURS=("DELAY_HOURS", "max"),
         MAX_DELAY_DAYS=("DELAY_DAYS", "max"),
     )
     .reset_index()
 )
+
+# Reorder columns pairwise (hours/days), plus early/delayed counts right after volume
+carrier_perf = carrier_perf[
+    [
+        "TENANT_NAME", "CARRIER_NAME", "CARRIER_SCAC",
+        "SHIPMENT_VOLUME", "DELAYED_SHIPMENTS", "EARLY_SHIPMENTS", "LANES",
+        "TOTAL_DELAY_HOURS", "TOTAL_DELAY_DAYS",
+        "AVG_DELAY_HOURS", "AVG_DELAY_DAYS",
+        "MEDIAN_DELAY_HOURS", "MEDIAN_DELAY_DAYS",
+        "MAX_DELAY_HOURS", "MAX_DELAY_DAYS",
+    ]
+]
 
 ascending_volume = True if tie_breaker.startswith("Lower") else False
 carrier_perf = carrier_perf.sort_values(
@@ -345,19 +388,34 @@ lane_perf = (
     .groupby(["TENANT_NAME", "LANE", "CARRIER_NAME", "CARRIER_SCAC"], dropna=False)
     .agg(
         SHIPMENT_VOLUME=("SHIPMENT_KEY", "nunique"),
+        DELAYED_SHIPMENTS=("IS_DELAYED", sum_bool),
+        EARLY_SHIPMENTS=("IS_EARLY", sum_bool),
 
         TOTAL_DELAY_HOURS=("DELAY_HOURS", "sum"),
-        AVG_DELAY_HOURS=("DELAY_HOURS", "mean"),
-        MEDIAN_DELAY_HOURS=("DELAY_HOURS", "median"),
-        MAX_DELAY_HOURS=("DELAY_HOURS", "max"),
-
         TOTAL_DELAY_DAYS=("DELAY_DAYS", "sum"),
+
+        AVG_DELAY_HOURS=("DELAY_HOURS", "mean"),
         AVG_DELAY_DAYS=("DELAY_DAYS", "mean"),
+
+        MEDIAN_DELAY_HOURS=("DELAY_HOURS", "median"),
         MEDIAN_DELAY_DAYS=("DELAY_DAYS", "median"),
+
+        MAX_DELAY_HOURS=("DELAY_HOURS", "max"),
         MAX_DELAY_DAYS=("DELAY_DAYS", "max"),
     )
     .reset_index()
 )
+
+lane_perf = lane_perf[
+    [
+        "TENANT_NAME", "LANE", "CARRIER_NAME", "CARRIER_SCAC",
+        "SHIPMENT_VOLUME", "DELAYED_SHIPMENTS", "EARLY_SHIPMENTS",
+        "TOTAL_DELAY_HOURS", "TOTAL_DELAY_DAYS",
+        "AVG_DELAY_HOURS", "AVG_DELAY_DAYS",
+        "MEDIAN_DELAY_HOURS", "MEDIAN_DELAY_DAYS",
+        "MAX_DELAY_HOURS", "MAX_DELAY_DAYS",
+    ]
+]
 
 lane_perf = lane_perf.sort_values(
     by=["TENANT_NAME", "LANE", "AVG_DELAY_HOURS", "SHIPMENT_VOLUME"],
@@ -374,15 +432,15 @@ for (tenant, lane), grp in lane_perf.groupby(["TENANT_NAME", "LANE"], sort=True)
         "CARRIER_NAME": "",
         "CARRIER_SCAC": "",
         "SHIPMENT_VOLUME": "",
-
+        "DELAYED_SHIPMENTS": "",
+        "EARLY_SHIPMENTS": "",
         "TOTAL_DELAY_HOURS": "",
-        "AVG_DELAY_HOURS": "",
-        "MEDIAN_DELAY_HOURS": "",
-        "MAX_DELAY_HOURS": "",
-
         "TOTAL_DELAY_DAYS": "",
+        "AVG_DELAY_HOURS": "",
         "AVG_DELAY_DAYS": "",
+        "MEDIAN_DELAY_HOURS": "",
         "MEDIAN_DELAY_DAYS": "",
+        "MAX_DELAY_HOURS": "",
         "MAX_DELAY_DAYS": "",
     })
 
@@ -392,32 +450,71 @@ for (tenant, lane), grp in lane_perf.groupby(["TENANT_NAME", "LANE"], sort=True)
             "LANE": r["LANE"],
             "CARRIER_NAME": r["CARRIER_NAME"],
             "CARRIER_SCAC": r["CARRIER_SCAC"],
+
             "SHIPMENT_VOLUME": int(r["SHIPMENT_VOLUME"]) if pd.notna(r["SHIPMENT_VOLUME"]) else "",
+            "DELAYED_SHIPMENTS": int(r["DELAYED_SHIPMENTS"]) if pd.notna(r["DELAYED_SHIPMENTS"]) else "",
+            "EARLY_SHIPMENTS": int(r["EARLY_SHIPMENTS"]) if pd.notna(r["EARLY_SHIPMENTS"]) else "",
 
             "TOTAL_DELAY_HOURS": float(r["TOTAL_DELAY_HOURS"]) if pd.notna(r["TOTAL_DELAY_HOURS"]) else "",
-            "AVG_DELAY_HOURS": float(r["AVG_DELAY_HOURS"]) if pd.notna(r["AVG_DELAY_HOURS"]) else "",
-            "MEDIAN_DELAY_HOURS": float(r["MEDIAN_DELAY_HOURS"]) if pd.notna(r["MEDIAN_DELAY_HOURS"]) else "",
-            "MAX_DELAY_HOURS": float(r["MAX_DELAY_HOURS"]) if pd.notna(r["MAX_DELAY_HOURS"]) else "",
-
             "TOTAL_DELAY_DAYS": float(r["TOTAL_DELAY_DAYS"]) if pd.notna(r["TOTAL_DELAY_DAYS"]) else "",
+
+            "AVG_DELAY_HOURS": float(r["AVG_DELAY_HOURS"]) if pd.notna(r["AVG_DELAY_HOURS"]) else "",
             "AVG_DELAY_DAYS": float(r["AVG_DELAY_DAYS"]) if pd.notna(r["AVG_DELAY_DAYS"]) else "",
+
+            "MEDIAN_DELAY_HOURS": float(r["MEDIAN_DELAY_HOURS"]) if pd.notna(r["MEDIAN_DELAY_HOURS"]) else "",
             "MEDIAN_DELAY_DAYS": float(r["MEDIAN_DELAY_DAYS"]) if pd.notna(r["MEDIAN_DELAY_DAYS"]) else "",
+
+            "MAX_DELAY_HOURS": float(r["MAX_DELAY_HOURS"]) if pd.notna(r["MAX_DELAY_HOURS"]) else "",
             "MAX_DELAY_DAYS": float(r["MAX_DELAY_DAYS"]) if pd.notna(r["MAX_DELAY_DAYS"]) else "",
         })
 
 lane_perf_formatted = pd.DataFrame(lane_rows)
 
 # ----------------------------
+# Early / Delayed container-level sheets (subset of RAW rows)
+# ----------------------------
+early_ship_keys = set(shipment_level_valid.loc[shipment_level_valid["IS_EARLY"], "SHIPMENT_KEY"].dropna().astype(str))
+delayed_ship_keys = set(shipment_level_valid.loc[shipment_level_valid["IS_DELAYED"], "SHIPMENT_KEY"].dropna().astype(str))
+
+df_raw["SHIPMENT_KEY_STR"] = df_raw["SHIPMENT_KEY"].astype(str)
+
+early_containers = df_raw[df_raw["SHIPMENT_KEY_STR"].isin(early_ship_keys)].copy()
+delayed_containers = df_raw[df_raw["SHIPMENT_KEY_STR"].isin(delayed_ship_keys)].copy()
+
+# Make these two sheets "focused" (container-level but key fields only)
+container_sheet_cols = [
+    "TENANT_NAME",
+    "CARRIER_NAME", "CARRIER_SCAC",
+    "MASTER_SHIPMENT_ID", "SHIPMENT_ID", "SUBSCRIPTION_ID",
+    "REQUEST_KEY", "REQUEST_KEY_TYPE",
+    "CONTAINER_NUMBER", "CONTAINER_TYPE",
+    "SHIPMENT_CREATED_DATE", "SUBSCRIPTION_CREATED_DT",
+    "LANE",
+    "ORIGIN_CITY", "ORIGIN_COUNTRY", "DESTINATION_CITY", "DESTINATION_COUNTRY",
+    "POL_LOCODE", "POL", "POD_LOCODE", "POD",
+    "VAD_PLANNED", "VAD", "VAD_P44", "VAD_ACTUAL_USED", "ACTUAL_SOURCE_USED",
+    "SIGNED_DELAY_HOURS", "SIGNED_DELAY_DAYS",
+]
+for c in container_sheet_cols:
+    safe_col(early_containers, c)
+    safe_col(delayed_containers, c)
+
+early_containers_export = early_containers[container_sheet_cols].copy()
+delayed_containers_export = delayed_containers[container_sheet_cols].copy()
+
+# ----------------------------
 # Preview
 # ----------------------------
 st.subheader("Preview")
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.metric("Rows (raw)", len(df_raw))
 with c2:
-    st.metric("Shipments (unique MASTER_SHIPMENT_ID/SHIPMENT_ID)", shipment_level["SHIPMENT_KEY"].nunique())
+    st.metric("Shipments (unique)", shipment_level["SHIPMENT_KEY"].nunique())
 with c3:
-    st.metric("Shipments usable for delay (have VAD_PLANNED and (VAD or VAD_P44))", len(shipment_level_valid))
+    st.metric("Shipments usable for delay", len(shipment_level_valid))
+with c4:
+    st.metric("Carriers in performance", carrier_perf[["CARRIER_NAME", "CARRIER_SCAC"]].drop_duplicates().shape[0])
 
 st.write("**Carrier Performance (preview)**")
 st.dataframe(carrier_perf, use_container_width=True)
@@ -425,10 +522,19 @@ st.dataframe(carrier_perf, use_container_width=True)
 st.write("**Lane Performance (preview sample)**")
 st.dataframe(lane_perf_formatted.head(60), use_container_width=True)
 
+st.write("**Early container rows / Delayed container rows**")
+st.write({"early_container_rows": int(len(early_containers_export)), "delayed_container_rows": int(len(delayed_containers_export))})
+
 # ----------------------------
 # Export
 # ----------------------------
-excel_bytes = to_excel_bytes(df_raw, carrier_perf, lane_perf_formatted)
+excel_bytes = to_excel_bytes(
+    df_raw,                 # Raw Data (full)
+    carrier_perf,           # Carrier Performance
+    lane_perf_formatted,    # Lane Performance (formatted)
+    early_containers_export,
+    delayed_containers_export
+)
 
 st.download_button(
     label="Download Excel Report",
