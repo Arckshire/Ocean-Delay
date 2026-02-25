@@ -12,7 +12,8 @@ st.write(
     "- Carrier Performance\n"
     "- Lane Performance\n"
     "- Early Containers (container-level subset)\n"
-    "- Delayed Containers (container-level subset)\n\n"
+    "- Delayed Containers (container-level subset)\n"
+    "- OnTime Containers (container-level subset)\n\n"
     "Definitions:\n"
     "- Shipment unit = MASTER_SHIPMENT_ID (fallback to SHIPMENT_ID)\n"
     "- Lane = ORIGIN_CITY → DESTINATION_CITY (fallback to POL → POD if missing)\n"
@@ -101,7 +102,8 @@ def to_excel_bytes(
     carrier_df: pd.DataFrame,
     lane_df: pd.DataFrame,
     early_containers_df: pd.DataFrame,
-    delayed_containers_df: pd.DataFrame
+    delayed_containers_df: pd.DataFrame,
+    ontime_containers_df: pd.DataFrame
 ) -> bytes:
     output = io.BytesIO()
 
@@ -110,6 +112,7 @@ def to_excel_bytes(
     lane_df = make_excel_safe(lane_df)
     early_containers_df = make_excel_safe(early_containers_df)
     delayed_containers_df = make_excel_safe(delayed_containers_df)
+    ontime_containers_df = make_excel_safe(ontime_containers_df)
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         raw_df.to_excel(writer, index=False, sheet_name="Raw_Data")
@@ -117,6 +120,7 @@ def to_excel_bytes(
         lane_df.to_excel(writer, index=False, sheet_name="Lane_Performance")
         early_containers_df.to_excel(writer, index=False, sheet_name="Early_Containers")
         delayed_containers_df.to_excel(writer, index=False, sheet_name="Delayed_Containers")
+        ontime_containers_df.to_excel(writer, index=False, sheet_name="OnTime_Containers")
 
     return output.getvalue()
 
@@ -175,12 +179,10 @@ required_cols = [
     "POL_INVALID", "POD_INVALID",
     "ORIGIN_PICKUP_PLANNED_INITIAL", "ORIGIN_PICKUP_ACTUAL",
     "DELIVERY_PLANNED_INITIAL", "DELIVERY_ACTUAL",
-    "CEP_PLANNED", "CGI_PLANNED", "CLL_PLANN",  # typo guard if present
-    "CLL_PLANNED", "VDL_PLANNED", "VAD_PLANNED", "CDD_PLANNED", "CGO_PLANNED", "CER_PLANNED",
+    "CEP_PLANNED", "CGI_PLANNED", "CLL_PLANNED", "VDL_PLANNED", "VAD_PLANNED", "CDD_PLANNED", "CGO_PLANNED", "CER_PLANNED",
     "CEP", "CGI", "CLL", "VDL", "VDL_P44", "VAD", "VAD_P44", "CDD", "CGO", "CER",
     "REPORTING_DATE", "REPORTING_DATE_6",
 ]
-# Ensure cols exist
 for c in required_cols:
     safe_col(df_raw, c)
 
@@ -274,7 +276,7 @@ shipment_level_valid["IS_DELAYED"] = shipment_level_valid["SIGNED_DELAY_HOURS"] 
 shipment_level_valid["IS_ONTIME"] = shipment_level_valid["SIGNED_DELAY_HOURS"] == 0
 
 # ----------------------------
-# Carrier performance (now includes ON_TIME)
+# Carrier performance (includes ON_TIME)
 # ----------------------------
 carrier_perf = (
     shipment_level_valid
@@ -301,7 +303,6 @@ carrier_perf = (
     .reset_index()
 )
 
-# Order columns pairwise
 carrier_perf = carrier_perf[
     [
         "TENANT_NAME", "CARRIER_NAME", "CARRIER_SCAC",
@@ -313,7 +314,6 @@ carrier_perf = carrier_perf[
     ]
 ]
 
-# Ranking sort
 ascending_volume = True if tie_breaker.startswith("Lower") else False
 carrier_perf = carrier_perf.sort_values(
     by=["AVG_DELAY_HOURS", "SHIPMENT_VOLUME"],
@@ -322,7 +322,7 @@ carrier_perf = carrier_perf.sort_values(
 ).reset_index(drop=True)
 
 # ----------------------------
-# Lane performance (now includes ON_TIME)
+# Lane performance (includes ON_TIME)
 # ----------------------------
 lane_perf = (
     shipment_level_valid
@@ -415,17 +415,18 @@ for (tenant, lane), grp in lane_perf.groupby(["TENANT_NAME", "LANE"], sort=True)
 lane_perf_formatted = pd.DataFrame(lane_rows)
 
 # ----------------------------
-# Early / Delayed container-level sheets (subset of RAW rows)
+# Container-level sheets (subset of RAW rows)
 # ----------------------------
 early_ship_keys = set(shipment_level_valid.loc[shipment_level_valid["IS_EARLY"], "SHIPMENT_KEY"].dropna().astype(str))
 delayed_ship_keys = set(shipment_level_valid.loc[shipment_level_valid["IS_DELAYED"], "SHIPMENT_KEY"].dropna().astype(str))
+ontime_ship_keys = set(shipment_level_valid.loc[shipment_level_valid["IS_ONTIME"], "SHIPMENT_KEY"].dropna().astype(str))
 
 df_raw["SHIPMENT_KEY_STR"] = df_raw["SHIPMENT_KEY"].astype(str)
 
 early_containers = df_raw[df_raw["SHIPMENT_KEY_STR"].isin(early_ship_keys)].copy()
 delayed_containers = df_raw[df_raw["SHIPMENT_KEY_STR"].isin(delayed_ship_keys)].copy()
+ontime_containers = df_raw[df_raw["SHIPMENT_KEY_STR"].isin(ontime_ship_keys)].copy()
 
-# Focused export columns for container-level sheets
 container_sheet_cols = [
     "TENANT_NAME",
     "CARRIER_NAME", "CARRIER_SCAC",
@@ -442,9 +443,11 @@ container_sheet_cols = [
 for c in container_sheet_cols:
     safe_col(early_containers, c)
     safe_col(delayed_containers, c)
+    safe_col(ontime_containers, c)
 
 early_containers_export = early_containers[container_sheet_cols].copy()
 delayed_containers_export = delayed_containers[container_sheet_cols].copy()
+ontime_containers_export = ontime_containers[container_sheet_cols].copy()
 
 # ----------------------------
 # Preview
@@ -466,33 +469,23 @@ st.dataframe(carrier_perf, use_container_width=True)
 st.write("**Lane Performance (preview sample)**")
 st.dataframe(lane_perf_formatted.head(60), use_container_width=True)
 
-# Quick reconciliation check (optional visual)
-with st.expander("Reconciliation check (Shipment Volume vs Early/Delayed/On-time)", expanded=False):
-    check = carrier_perf.copy()
-    check["EARLY+DELAYED+ON_TIME"] = (
-        check["EARLY_SHIPMENTS"] + check["DELAYED_SHIPMENTS"] + check["ON_TIME_SHIPMENTS"]
-    )
-    st.dataframe(
-        check[[
-            "TENANT_NAME", "CARRIER_NAME", "CARRIER_SCAC",
-            "SHIPMENT_VOLUME", "DELAYED_SHIPMENTS", "EARLY_SHIPMENTS", "ON_TIME_SHIPMENTS",
-            "EARLY+DELAYED+ON_TIME"
-        ]],
-        use_container_width=True
-    )
-
-st.write("**Early container rows / Delayed container rows**")
-st.write({"early_container_rows": int(len(early_containers_export)), "delayed_container_rows": int(len(delayed_containers_export))})
+st.write("**Container-level sheet row counts**")
+st.write({
+    "early_container_rows": int(len(early_containers_export)),
+    "delayed_container_rows": int(len(delayed_containers_export)),
+    "ontime_container_rows": int(len(ontime_containers_export)),
+})
 
 # ----------------------------
 # Export
 # ----------------------------
 excel_bytes = to_excel_bytes(
-    df_raw,                 # Raw Data (full)
-    carrier_perf,           # Carrier Performance
-    lane_perf_formatted,    # Lane Performance (formatted)
+    df_raw,
+    carrier_perf,
+    lane_perf_formatted,
     early_containers_export,
-    delayed_containers_export
+    delayed_containers_export,
+    ontime_containers_export
 )
 
 st.download_button(
