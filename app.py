@@ -14,7 +14,10 @@ st.write(
     "Definitions:\n"
     "- Shipment unit = MASTER_SHIPMENT_ID (fallback to SHIPMENT_ID)\n"
     "- Lane = ORIGIN_CITY → DESTINATION_CITY (fallback to POL → POD if missing)\n"
-    "- Delay = VAD - VAD_PLANNED (in hours/days)\n"
+    "- Delay uses **Actual Arrival** as:\n"
+    "  1) `VAD` if present\n"
+    "  2) else `VAD_P44` if `VAD` missing\n"
+    "  Delay = Actual Arrival - `VAD_PLANNED` (in hours/days)\n"
 )
 
 # ----------------------------
@@ -28,7 +31,6 @@ def clean_str(x):
 
 
 def to_dt(series: pd.Series) -> pd.Series:
-    # Parse timestamps consistently; use UTC for consistent math.
     return pd.to_datetime(series, errors="coerce", utc=True)
 
 
@@ -43,11 +45,6 @@ def build_lane(df: pd.DataFrame) -> pd.Series:
     dest_final = dest_node.fillna(pod_node).fillna("UNKNOWN_DEST")
 
     return origin_final.astype(str) + " -> " + dest_final.astype(str)
-
-
-def compute_delay_hours(vad_planned: pd.Series, vad_actual: pd.Series) -> pd.Series:
-    delta = (vad_actual - vad_planned)
-    return delta.dt.total_seconds() / 3600.0
 
 
 def safe_col(df: pd.DataFrame, col: str) -> pd.DataFrame:
@@ -74,7 +71,6 @@ def make_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
         if pd.api.types.is_datetime64tz_dtype(out[col]):
             out[col] = out[col].dt.tz_convert(None)
 
-    # Handle object columns that might contain tz-aware pd.Timestamp values
     for col in out.columns:
         if out[col].dtype == "object":
             sample = out[col].dropna().head(50)
@@ -99,6 +95,21 @@ def to_excel_bytes(raw_df: pd.DataFrame, carrier_df: pd.DataFrame, lane_df: pd.D
         lane_df.to_excel(writer, index=False, sheet_name="Lane_Performance")
 
     return output.getvalue()
+
+
+def compute_delay_hours(planned: pd.Series, actual: pd.Series) -> pd.Series:
+    # planned and actual are datetime series
+    delta = actual - planned
+    return delta.dt.total_seconds() / 3600.0
+
+
+def pick_actual_arrival(vad: pd.Series, vad_p44: pd.Series) -> pd.Series:
+    """
+    Actual arrival selection rule:
+    - Use VAD if present
+    - Else use VAD_P44
+    """
+    return vad.combine_first(vad_p44)
 
 
 # ----------------------------
@@ -168,6 +179,7 @@ df_raw["SHIPMENT_MODIFIED_DATE"] = to_dt(df_raw["SHIPMENT_MODIFIED_DATE"])
 df_raw["SUBSCRIPTION_CREATED_DT"] = to_dt(df_raw["SUBSCRIPTION_CREATED_DT"])
 df_raw["VAD_PLANNED"] = to_dt(df_raw["VAD_PLANNED"])
 df_raw["VAD"] = to_dt(df_raw["VAD"])
+df_raw["VAD_P44"] = to_dt(df_raw["VAD_P44"])
 
 # Compute lane and shipment key
 df_raw["LANE"] = build_lane(df_raw)
@@ -175,8 +187,11 @@ df_raw["LANE"] = build_lane(df_raw)
 df_raw["SHIPMENT_KEY"] = df_raw["MASTER_SHIPMENT_ID"].map(clean_str)
 df_raw.loc[df_raw["SHIPMENT_KEY"].isna(), "SHIPMENT_KEY"] = df_raw["SHIPMENT_ID"].map(clean_str)
 
-# Row-level delay (for raw visibility)
-df_raw["DELAY_HOURS_RAW"] = compute_delay_hours(df_raw["VAD_PLANNED"], df_raw["VAD"])
+# Select actual arrival per-row and compute raw delay
+df_raw["VAD_ACTUAL_USED"] = pick_actual_arrival(df_raw["VAD"], df_raw["VAD_P44"])
+df_raw["ACTUAL_SOURCE_USED"] = np.where(df_raw["VAD"].notna(), "VAD", np.where(df_raw["VAD_P44"].notna(), "VAD_P44", ""))
+
+df_raw["DELAY_HOURS_RAW"] = compute_delay_hours(df_raw["VAD_PLANNED"], df_raw["VAD_ACTUAL_USED"])
 df_raw["DELAY_HOURS"] = df_raw["DELAY_HOURS_RAW"].clip(lower=0) if clamp_negative else df_raw["DELAY_HOURS_RAW"]
 df_raw["DELAY_DAYS"] = df_raw["DELAY_HOURS"] / 24.0
 
@@ -199,20 +214,32 @@ shipment_level = (
         "LANE": first_non_null,
         "POL": first_non_null,
         "POD": first_non_null,
+
         "VAD_PLANNED": "max",
         "VAD": "max",
+        "VAD_P44": "max",
+
         "SHIPMENT_CREATED_DATE": "min",
         "SHIPMENT_MODIFIED_DATE": "max",
     })
     .reset_index()
 )
 
-shipment_level["DELAY_HOURS_RAW"] = compute_delay_hours(shipment_level["VAD_PLANNED"], shipment_level["VAD"])
+# Pick actual arrival at shipment level (prefer VAD over VAD_P44)
+shipment_level["VAD_ACTUAL_USED"] = pick_actual_arrival(shipment_level["VAD"], shipment_level["VAD_P44"])
+shipment_level["ACTUAL_SOURCE_USED"] = np.where(
+    shipment_level["VAD"].notna(), "VAD",
+    np.where(shipment_level["VAD_P44"].notna(), "VAD_P44", "")
+)
+
+shipment_level["DELAY_HOURS_RAW"] = compute_delay_hours(shipment_level["VAD_PLANNED"], shipment_level["VAD_ACTUAL_USED"])
 shipment_level["DELAY_HOURS"] = shipment_level["DELAY_HOURS_RAW"].clip(lower=0) if clamp_negative else shipment_level["DELAY_HOURS_RAW"]
 shipment_level["DELAY_DAYS"] = shipment_level["DELAY_HOURS"] / 24.0
 
-# Shipments usable for delay calculations
-shipment_level_valid = shipment_level.dropna(subset=["VAD_PLANNED", "VAD"])
+# Shipments usable for delay calculations:
+# - Must have planned VAD
+# - Must have either VAD or VAD_P44 (via VAD_ACTUAL_USED)
+shipment_level_valid = shipment_level.dropna(subset=["VAD_PLANNED", "VAD_ACTUAL_USED"])
 
 # ----------------------------
 # Diagnostics: which carriers are excluded and why
@@ -240,31 +267,35 @@ missing_carriers = (
     .drop(columns=["_merge"])
 )
 
-# Per-carrier coverage counts at shipment level
 tmp = shipment_level.copy()
-tmp["HAS_VAD"] = tmp["VAD"].notna()
 tmp["HAS_VAD_PLANNED"] = tmp["VAD_PLANNED"].notna()
-tmp["HAS_BOTH"] = tmp["HAS_VAD"] & tmp["HAS_VAD_PLANNED"]
+tmp["HAS_VAD"] = tmp["VAD"].notna()
+tmp["HAS_VAD_P44"] = tmp["VAD_P44"].notna()
+tmp["HAS_ACTUAL_USED"] = tmp["VAD_ACTUAL_USED"].notna()
+tmp["HAS_BOTH_FOR_DELAY"] = tmp["HAS_VAD_PLANNED"] & tmp["HAS_ACTUAL_USED"]
 
 carrier_diag = (
     tmp
     .groupby(["TENANT_NAME", "CARRIER_NAME", "CARRIER_SCAC"], dropna=False)
     .agg(
         SHIPMENT_VOLUME=("SHIPMENT_KEY", "nunique"),
-        SHIPMENTS_WITH_VAD=("HAS_VAD", "sum"),
         SHIPMENTS_WITH_VAD_PLANNED=("HAS_VAD_PLANNED", "sum"),
-        SHIPMENTS_WITH_BOTH=("HAS_BOTH", "sum"),
-        MISSING_VAD=("HAS_VAD", lambda s: (~s).sum()),
-        MISSING_VAD_PLANNED=("HAS_VAD_PLANNED", lambda s: (~s).sum()),
+        SHIPMENTS_WITH_VAD=("HAS_VAD", "sum"),
+        SHIPMENTS_WITH_VAD_P44=("HAS_VAD_P44", "sum"),
+        SHIPMENTS_WITH_ACTUAL_USED=("HAS_ACTUAL_USED", "sum"),
+        SHIPMENTS_USABLE_FOR_DELAY=("HAS_BOTH_FOR_DELAY", "sum"),
+        MISSING_PLANNED=("HAS_VAD_PLANNED", lambda s: (~s).sum()),
+        MISSING_ACTUAL_BOTH=("HAS_ACTUAL_USED", lambda s: (~s).sum()),
     )
     .reset_index()
-    .sort_values(["SHIPMENTS_WITH_BOTH", "SHIPMENT_VOLUME"], ascending=[True, True])
+    .sort_values(["SHIPMENTS_USABLE_FOR_DELAY", "SHIPMENT_VOLUME"], ascending=[True, True])
 )
 
 st.subheader("Why you may see fewer carriers in Carrier_Performance")
 st.write(
-    "A carrier is excluded from **Carrier_Performance** if it has **zero shipments** where both "
-    "`VAD_PLANNED` and `VAD` are present after rolling up to `MASTER_SHIPMENT_ID`."
+    "A carrier is excluded from **Carrier_Performance** if it has **zero shipments** where:\n"
+    "- `VAD_PLANNED` exists, and\n"
+    "- at least one of `VAD` or `VAD_P44` exists (we prefer `VAD` when both exist)."
 )
 
 if len(missing_carriers) == 0:
@@ -277,7 +308,7 @@ st.write("**Carrier diagnostic (shipment-level timestamp coverage):**")
 st.dataframe(carrier_diag, use_container_width=True)
 
 # ----------------------------
-# Carrier performance (shipment-level)
+# Carrier performance
 # ----------------------------
 carrier_perf = (
     shipment_level_valid
@@ -307,7 +338,7 @@ carrier_perf = carrier_perf.sort_values(
 ).reset_index(drop=True)
 
 # ----------------------------
-# Lane performance (shipment-level)
+# Lane performance
 # ----------------------------
 lane_perf = (
     shipment_level_valid
@@ -334,10 +365,9 @@ lane_perf = lane_perf.sort_values(
     kind="mergesort"
 ).reset_index(drop=True)
 
-# Create the “lane header row + carriers” layout
+# Lane formatted layout (header row + detail rows)
 lane_rows = []
 for (tenant, lane), grp in lane_perf.groupby(["TENANT_NAME", "LANE"], sort=True):
-    # Header row
     lane_rows.append({
         "TENANT_NAME": tenant,
         "LANE": lane,
@@ -356,7 +386,6 @@ for (tenant, lane), grp in lane_perf.groupby(["TENANT_NAME", "LANE"], sort=True)
         "MAX_DELAY_DAYS": "",
     })
 
-    # Detail rows
     for _, r in grp.iterrows():
         lane_rows.append({
             "TENANT_NAME": r["TENANT_NAME"],
@@ -388,7 +417,7 @@ with c1:
 with c2:
     st.metric("Shipments (unique MASTER_SHIPMENT_ID/SHIPMENT_ID)", shipment_level["SHIPMENT_KEY"].nunique())
 with c3:
-    st.metric("Shipments usable for delay (have VAD & VAD_PLANNED)", len(shipment_level_valid))
+    st.metric("Shipments usable for delay (have VAD_PLANNED and (VAD or VAD_P44))", len(shipment_level_valid))
 
 st.write("**Carrier Performance (preview)**")
 st.dataframe(carrier_perf, use_container_width=True)
