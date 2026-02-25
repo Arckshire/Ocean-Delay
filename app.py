@@ -22,9 +22,11 @@ def clean_str(x):
     s = str(x).strip()
     return s if s != "" and s.lower() != "nan" else None
 
+
 def to_dt(series: pd.Series) -> pd.Series:
-    # Snowflake extracts may include timezone offsets; utc=True handles both tz-aware & naive.
+    # Parse timestamps consistently; use UTC to avoid mixed timezone issues during math.
     return pd.to_datetime(series, errors="coerce", utc=True)
+
 
 def build_lane(df: pd.DataFrame) -> pd.Series:
     # Lane logic:
@@ -41,15 +43,65 @@ def build_lane(df: pd.DataFrame) -> pd.Series:
 
     return origin_final.astype(str) + " -> " + dest_final.astype(str)
 
+
 def compute_delay_hours(vad_planned: pd.Series, vad_actual: pd.Series) -> pd.Series:
     # Returns float hours (can be negative if early)
     delta = (vad_actual - vad_planned)
     return delta.dt.total_seconds() / 3600.0
 
-def safe_col(df, col):
+
+def safe_col(df: pd.DataFrame, col: str) -> pd.DataFrame:
     if col not in df.columns:
         df[col] = np.nan
     return df
+
+
+def first_non_null(series: pd.Series):
+    s = series.dropna()
+    if len(s) == 0:
+        return np.nan
+    return s.iloc[0]
+
+
+def make_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Excel cannot handle timezone-aware datetimes.
+    Convert any tz-aware datetime columns to tz-naive before exporting.
+    """
+    out = df.copy()
+
+    # Convert tz-aware datetime64 columns
+    for col in out.columns:
+        if pd.api.types.is_datetime64tz_dtype(out[col]):
+            out[col] = out[col].dt.tz_convert(None)
+
+    # Handle object columns that may contain tz-aware pd.Timestamp values
+    for col in out.columns:
+        if out[col].dtype == "object":
+            sample = out[col].dropna().head(50)
+            if len(sample) and any(isinstance(v, pd.Timestamp) and v.tz is not None for v in sample):
+                out[col] = out[col].apply(
+                    lambda v: v.tz_convert(None) if isinstance(v, pd.Timestamp) and v.tz is not None else v
+                )
+
+    return out
+
+
+def to_excel_bytes(raw_df: pd.DataFrame, carrier_df: pd.DataFrame, lane_df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+
+    raw_df = make_excel_safe(raw_df)
+    carrier_df = make_excel_safe(carrier_df)
+    lane_df = make_excel_safe(lane_df)
+
+    # Force xlsxwriter (no openpyxl dependency needed)
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        raw_df.to_excel(writer, index=False, sheet_name="Raw_Data")
+        carrier_df.to_excel(writer, index=False, sheet_name="Carrier_Performance")
+        lane_df.to_excel(writer, index=False, sheet_name="Lane_Performance")
+
+    return output.getvalue()
+
 
 # ----------------------------
 # UI
@@ -69,8 +121,7 @@ with st.expander("Settings", expanded=True):
         ],
         index=0
     )
-
-    lane_definition_note = st.info(
+    st.info(
         "Lane = (ORIGIN_CITY -> DESTINATION_CITY). If ORIGIN_CITY or DESTINATION_CITY is blank, "
         "fallback to (POL -> POD)."
     )
@@ -87,7 +138,7 @@ except Exception as e:
     st.error(f"Could not read CSV: {e}")
     st.stop()
 
-# Ensure required columns exist (we'll create missing ones as NaN to avoid crashes)
+# Ensure required columns exist (create missing as NaN)
 required_cols = [
     "TENANT_NAME", "SHIPMENT_ID", "MASTER_SHIPMENT_ID", "SUBSCRIPTION_ID",
     "SHIPMENT_CREATED_DATE", "SHIPMENT_MODIFIED_DATE", "SUBSCRIPTION_CREATED_DT",
@@ -114,41 +165,26 @@ required_cols = [
 for c in required_cols:
     safe_col(df_raw, c)
 
-# Parse datetimes we care about
+# Parse key datetime columns
 df_raw["SHIPMENT_CREATED_DATE"] = to_dt(df_raw["SHIPMENT_CREATED_DATE"])
 df_raw["SHIPMENT_MODIFIED_DATE"] = to_dt(df_raw["SHIPMENT_MODIFIED_DATE"])
 df_raw["SUBSCRIPTION_CREATED_DT"] = to_dt(df_raw["SUBSCRIPTION_CREATED_DT"])
 df_raw["VAD_PLANNED"] = to_dt(df_raw["VAD_PLANNED"])
 df_raw["VAD"] = to_dt(df_raw["VAD"])
 
-# Compute lane on row level (for raw sheet)
+# Compute lane and shipment key
 df_raw["LANE"] = build_lane(df_raw)
 
-# Shipment key: MASTER_SHIPMENT_ID preferred; fallback to SHIPMENT_ID
 df_raw["SHIPMENT_KEY"] = df_raw["MASTER_SHIPMENT_ID"].map(clean_str)
 df_raw.loc[df_raw["SHIPMENT_KEY"].isna(), "SHIPMENT_KEY"] = df_raw["SHIPMENT_ID"].map(clean_str)
 
-# Compute row-level delay (mostly for visibility)
+# Row-level delay (mostly for debugging/visibility)
 df_raw["DELAY_HOURS_RAW"] = compute_delay_hours(df_raw["VAD_PLANNED"], df_raw["VAD"])
-
-if clamp_negative:
-    df_raw["DELAY_HOURS"] = df_raw["DELAY_HOURS_RAW"].clip(lower=0)
-else:
-    df_raw["DELAY_HOURS"] = df_raw["DELAY_HOURS_RAW"]
+df_raw["DELAY_HOURS"] = df_raw["DELAY_HOURS_RAW"].clip(lower=0) if clamp_negative else df_raw["DELAY_HOURS_RAW"]
 
 # ----------------------------
-# Roll up to SHIPMENT level (MASTER_SHIPMENT_ID)
+# Roll up to SHIPMENT level
 # ----------------------------
-# Because multiple containers can share a shipment, we aggregate at SHIPMENT_KEY.
-# For timestamps, we take the MAX non-null planned and actual (latest known values).
-# For carrier/lane fields, we take the first non-null value (they should be consistent within shipment).
-def first_non_null(series: pd.Series):
-    s = series.dropna()
-    if len(s) == 0:
-        return np.nan
-    # keep original value type
-    return s.iloc[0]
-
 shipment_level = (
     df_raw
     .groupby("SHIPMENT_KEY", dropna=False)
@@ -176,7 +212,7 @@ shipment_level = (
 shipment_level["DELAY_HOURS_RAW"] = compute_delay_hours(shipment_level["VAD_PLANNED"], shipment_level["VAD"])
 shipment_level["DELAY_HOURS"] = shipment_level["DELAY_HOURS_RAW"].clip(lower=0) if clamp_negative else shipment_level["DELAY_HOURS_RAW"]
 
-# Keep only shipments that have both planned & actual (otherwise delay can't be computed)
+# Keep shipments usable for delay calcs
 shipment_level_valid = shipment_level.dropna(subset=["VAD_PLANNED", "VAD"])
 
 # ----------------------------
@@ -196,7 +232,6 @@ carrier_perf = (
     .reset_index()
 )
 
-# Ranking sort
 ascending_volume = True if tie_breaker.startswith("Lower") else False
 carrier_perf = carrier_perf.sort_values(
     by=["AVG_DELAY_HOURS", "SHIPMENTS"],
@@ -229,7 +264,6 @@ lane_perf = lane_perf.sort_values(
 # Create the “lane header row + carriers” layout
 lane_rows = []
 for (tenant, lane), grp in lane_perf.groupby(["TENANT_NAME", "LANE"], sort=True):
-    # Header row
     lane_rows.append({
         "TENANT_NAME": tenant,
         "LANE": lane,
@@ -241,7 +275,6 @@ for (tenant, lane), grp in lane_perf.groupby(["TENANT_NAME", "LANE"], sort=True)
         "MEDIAN_DELAY_HOURS": "",
         "MAX_DELAY_HOURS": "",
     })
-    # Detail rows
     for _, r in grp.iterrows():
         lane_rows.append({
             "TENANT_NAME": r["TENANT_NAME"],
@@ -258,7 +291,7 @@ for (tenant, lane), grp in lane_perf.groupby(["TENANT_NAME", "LANE"], sort=True)
 lane_perf_formatted = pd.DataFrame(lane_rows)
 
 # ----------------------------
-# Preview in app
+# Preview
 # ----------------------------
 st.subheader("Preview")
 c1, c2, c3 = st.columns(3)
@@ -276,16 +309,8 @@ st.write("**Lane Performance (sample)**")
 st.dataframe(lane_perf_formatted.head(40), use_container_width=True)
 
 # ----------------------------
-# Export to Excel
+# Export
 # ----------------------------
-def to_excel_bytes(raw_df, carrier_df, lane_df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        raw_df.to_excel(writer, index=False, sheet_name="Raw_Data")
-        carrier_df.to_excel(writer, index=False, sheet_name="Carrier_Performance")
-        lane_df.to_excel(writer, index=False, sheet_name="Lane_Performance")
-    return output.getvalue()
-
 excel_bytes = to_excel_bytes(df_raw, carrier_perf, lane_perf_formatted)
 
 st.download_button(
